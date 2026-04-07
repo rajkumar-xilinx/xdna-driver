@@ -1,0 +1,364 @@
+From c048ba6602cc9856c434f8b60af3a82dfecb48b4 Mon Sep 17 00:00:00 2001
+From: Saifuddin Kaijar <saifuddin.kaijar@amd.com>
+Date: Wed, 1 Apr 2026 16:32:42 +0530
+Subject: [PATCH] accel/amdxdna: Add auxiliary bus driver and VE2 hardware
+ support
+
+Implement auxiliary bus driver for ARM64 AUX devices and add VE2
+hardware placeholder following the AIE2 PCI driver pattern.
+
+Auxiliary Driver (amdxdna_aux_drv.c):
+- Probe function with DRM device allocation via devm_drm_dev_alloc()
+- Uses framework's amdxdna_dev_init()/amdxdna_dev_cleanup()
+- DMA mask configuration for auxiliary devices (64-bit with 32-bit fallback)
+- Device matching for "xilinx_aie.amdxdna"
+- Proper error handling with cleanup paths
+
+VE2 Hardware Support (ve2_aux.c/h):
+- Placeholder implementation matching amdxdna_dev_ops interface
+- All operations return -EOPNOTSUPP until full implementation
+- Functions: init, fini, hwctx management, cmd_submit, get_aie_info, etc.
+- Ready for real VE2 hardware implementation
+
+Move AIE-specific code to PCI driver:
+- Move notifier_wq and notifier_lock initialization from common
+  amdxdna_dev_init() to PCI-specific amdxdna_probe()
+- Move LOCKDEP validation for notifier_lock to PCI driver
+- Move workqueue cleanup from amdxdna_dev_cleanup() to PCI remove
+- AUX driver doesn't need AIE-specific notifier infrastructure
+
+Build configuration:
+- Added ve2_aux.o to AUX build in Kbuild
+- VE2 device info structure using ve2_ops
+
+The auxiliary driver follows the same pattern as the PCI driver but
+adapted for auxiliary bus devices. VE2 support is added as a placeholder
+similar to how AIE2 support is structured for PCI devices.
+
+Signed-off-by: Saifuddin Kaijar <saifuddin.kaijar@amd.com>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ drivers/accel/amdxdna/Kbuild            |  3 +-
+ drivers/accel/amdxdna/amdxdna_aux_drv.c | 63 ++++++++++++++++---
+ drivers/accel/amdxdna/amdxdna_drv.c     | 19 +-----
+ drivers/accel/amdxdna/amdxdna_pci_drv.c | 19 +++++-
+ drivers/accel/amdxdna/ve2_aux.c         | 82 +++++++++++++++++++++++++
+ drivers/accel/amdxdna/ve2_aux.h         | 13 ++++
+ 6 files changed, 171 insertions(+), 28 deletions(-)
+ create mode 100644 drivers/accel/amdxdna/ve2_aux.c
+ create mode 100644 drivers/accel/amdxdna/ve2_aux.h
+
+diff --git a/drivers/accel/amdxdna/Kbuild b/drivers/accel/amdxdna/Kbuild
+index 248d33b..fd1c7c9 100644
+--- a/drivers/accel/amdxdna/Kbuild
++++ b/drivers/accel/amdxdna/Kbuild
+@@ -58,4 +58,5 @@ amdxdna-$(CONFIG_PCI_IOV) += \
+ 	aie4_sriov.o
+ 
+ amdxdna-$(OFT_CONFIG_AMDXDNA_AUX) += \
+-	amdxdna_aux_drv.o
++	amdxdna_aux_drv.o \
++	ve2_aux.o
+diff --git a/drivers/accel/amdxdna/amdxdna_aux_drv.c b/drivers/accel/amdxdna/amdxdna_aux_drv.c
+index 3b6982f..7a9828c 100644
+--- a/drivers/accel/amdxdna/amdxdna_aux_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_aux_drv.c
+@@ -3,15 +3,23 @@
+  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
+  */
+ 
++#include <drm/drm_drv.h>
++#include <drm/drm_managed.h>
+ #include <linux/auxiliary_bus.h>
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ 
+ #include "amdxdna_drv.h"
++#include "ve2_aux.h"
+ 
+-#define AMDXDNA_VE2_AUX_NAME	"amdxdna_ve2"
++const struct amdxdna_dev_info dev_ve2_info = {
++	.device_type	= 0,
++	.dev_priv	= NULL,
++	.ops		= &ve2_ops,
++};
+ 
+ static const struct auxiliary_device_id amdxdna_ve2_aux_id_table[] = {
+-	{ .name = AMDXDNA_VE2_AUX_NAME },
++	{ .name = "xilinx_aie.amdxdna" },
+ 	{}
+ };
+ 
+@@ -20,20 +28,57 @@ MODULE_DEVICE_TABLE(auxiliary, amdxdna_ve2_aux_id_table);
+ static int amdxdna_ve2_aux_probe(struct auxiliary_device *auxdev,
+ 				 const struct auxiliary_device_id *id)
+ {
+-	/* Placeholder: full VE2 DRM accel device init to be implemented */
+-	return -ENODEV;
++	struct device *dev = &auxdev->dev;
++	struct amdxdna_dev *xdna;
++	int ret;
++
++	xdna = devm_drm_dev_alloc(dev, &amdxdna_drm_drv, typeof(*xdna), ddev);
++	if (IS_ERR(xdna))
++		return PTR_ERR(xdna);
++
++	xdna->dev_info = &dev_ve2_info;
++	if (!xdna->dev_info)
++		return -ENODEV;
++
++	auxiliary_set_drvdata(auxdev, xdna);
++
++	ret = amdxdna_dev_init(xdna);
++	if (ret)
++		return ret;
++
++	if (!dev->dma_mask) {
++		dev->coherent_dma_mask = DMA_BIT_MASK(64);
++		dev->dma_mask = &dev->coherent_dma_mask;
++	}
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
++	if (ret) {
++		ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++		if (ret) {
++			XDNA_ERR(xdna, "DMA mask set failed (64 and 32 bit), ret %d", ret);
++			goto failed_dev_cleanup;
++		}
++		XDNA_WARN(xdna, "DMA configuration downgraded to 32bit Mask\n");
++	}
++
++	return 0;
++
++failed_dev_cleanup:
++	amdxdna_dev_cleanup(xdna);
++	return ret;
+ }
+ 
+ static void amdxdna_ve2_aux_remove(struct auxiliary_device *auxdev)
+ {
+-	/* Placeholder: full VE2 device teardown to be implemented */
++	struct amdxdna_dev *xdna = auxiliary_get_drvdata(auxdev);
++
++	amdxdna_dev_cleanup(xdna);
+ }
+ 
+ static struct auxiliary_driver amdxdna_ve2_aux_driver = {
+-	.name	= AMDXDNA_VE2_AUX_NAME,
+-	.probe	= amdxdna_ve2_aux_probe,
+-	.remove	= amdxdna_ve2_aux_remove,
+-	.id_table = amdxdna_ve2_aux_id_table,
++	.name		= "amdxdna",
++	.probe		= amdxdna_ve2_aux_probe,
++	.remove		= amdxdna_ve2_aux_remove,
++	.id_table	= amdxdna_ve2_aux_id_table,
+ };
+ 
+ module_auxiliary_driver(amdxdna_ve2_aux_driver);
+diff --git a/drivers/accel/amdxdna/amdxdna_drv.c b/drivers/accel/amdxdna/amdxdna_drv.c
+index cc28919..176848b 100644
+--- a/drivers/accel/amdxdna/amdxdna_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_drv.c
+@@ -216,25 +216,14 @@ int amdxdna_dev_init(struct amdxdna_dev *xdna)
+ 	int ret;
+ 
+ 	drmm_mutex_init(&xdna->ddev, &xdna->dev_lock);
+-	init_rwsem(&xdna->notifier_lock);
+ 	INIT_LIST_HEAD(&xdna->client_list);
+ 
+-	if (IS_ENABLED(CONFIG_LOCKDEP)) {
+-		fs_reclaim_acquire(GFP_KERNEL);
+-		might_lock(&xdna->notifier_lock);
+-		fs_reclaim_release(GFP_KERNEL);
+-	}
+-
+-	xdna->notifier_wq = alloc_ordered_workqueue("notifier_wq", WQ_MEM_RECLAIM);
+-	if (!xdna->notifier_wq)
+-		return -ENOMEM;
+-
+ 	mutex_lock(&xdna->dev_lock);
+ 	ret = xdna->dev_info->ops->init(xdna);
+ 	mutex_unlock(&xdna->dev_lock);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Hardware init failed, ret %d", ret);
+-		goto destroy_notifier_wq;
++		return ret;
+ 	}
+ 
+ 	ret = amdxdna_sysfs_init(xdna);
+@@ -257,8 +246,6 @@ failed_dev_fini:
+ 	mutex_lock(&xdna->dev_lock);
+ 	xdna->dev_info->ops->fini(xdna);
+ 	mutex_unlock(&xdna->dev_lock);
+-destroy_notifier_wq:
+-	destroy_workqueue(xdna->notifier_wq);
+ 	return ret;
+ }
+ 
+@@ -266,14 +253,12 @@ destroy_notifier_wq:
+  * amdxdna_dev_cleanup - amdxdna device cleanup
+  * @xdna: Pointer to amdxdna device
+  *
+- * Cleans up all clients, finalizes hardware, and destroys workqueue.
++ * Cleans up all clients and finalizes hardware.
+  */
+ void amdxdna_dev_cleanup(struct amdxdna_dev *xdna)
+ {
+ 	struct amdxdna_client *client;
+ 
+-	destroy_workqueue(xdna->notifier_wq);
+-
+ 	drm_dev_unplug(&xdna->ddev);
+ 	amdxdna_sysfs_fini(xdna);
+ 
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.c b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+index c6ba200..aec22e4 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+@@ -90,12 +90,28 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (ret)
+ 		return ret;
+ 
++	init_rwsem(&xdna->notifier_lock);
++
++	if (IS_ENABLED(CONFIG_LOCKDEP)) {
++		fs_reclaim_acquire(GFP_KERNEL);
++		might_lock(&xdna->notifier_lock);
++		fs_reclaim_release(GFP_KERNEL);
++	}
++
++	xdna->notifier_wq = alloc_ordered_workqueue("notifier_wq", WQ_MEM_RECLAIM);
++	if (!xdna->notifier_wq) {
++		ret = -ENOMEM;
++		goto failed_iommu_fini;
++	}
++
+ 	ret = amdxdna_dev_init(xdna);
+ 	if (ret)
+-		goto failed_iommu_fini;
++		goto failed_destroy_wq;
+ 
+ 	return 0;
+ 
++failed_destroy_wq:
++	destroy_workqueue(xdna->notifier_wq);
+ failed_iommu_fini:
+ 	amdxdna_iommu_fini(xdna);
+ 	return ret;
+@@ -106,6 +122,7 @@ static void amdxdna_remove(struct pci_dev *pdev)
+ 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
+ 
+ 	amdxdna_dev_cleanup(xdna);
++	destroy_workqueue(xdna->notifier_wq);
+ 	amdxdna_iommu_fini(xdna);
+ }
+ 
+diff --git a/drivers/accel/amdxdna/ve2_aux.c b/drivers/accel/amdxdna/ve2_aux.c
+new file mode 100644
+index 0000000..e2f421e
+--- /dev/null
++++ b/drivers/accel/amdxdna/ve2_aux.c
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2025-2026, Advanced Micro Devices, Inc.
++ */
++
++#include <linux/errno.h>
++
++#include "amdxdna_drv.h"
++#include "ve2_aux.h"
++
++struct amdxdna_hwctx;
++struct amdxdna_sched_job;
++struct amdxdna_gem_obj;
++
++static int ve2_init(struct amdxdna_dev *xdna)
++{
++	return -EOPNOTSUPP;
++}
++
++static void ve2_fini(struct amdxdna_dev *xdna)
++{
++}
++
++static int ve2_get_aie_info(struct amdxdna_client *client,
++			    struct amdxdna_drm_get_info *args)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ve2_set_aie_state(struct amdxdna_client *client,
++			     struct amdxdna_drm_set_state *args)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ve2_hwctx_init(struct amdxdna_hwctx *hwctx)
++{
++	return -EOPNOTSUPP;
++}
++
++static void ve2_hwctx_fini(struct amdxdna_hwctx *hwctx)
++{
++}
++
++static int ve2_hwctx_config(struct amdxdna_hwctx *hwctx, u32 type, u64 value, void *buf, u32 size)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ve2_hwctx_sync_debug_bo(struct amdxdna_hwctx *hwctx, u32 debug_bo_hdl)
++{
++	return -EOPNOTSUPP;
++}
++
++static void ve2_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq)
++{
++}
++
++static int ve2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq)
++{
++	return -EOPNOTSUPP;
++}
++
++static int ve2_get_array(struct amdxdna_client *client,
++			 struct amdxdna_drm_get_array *args)
++{
++	return -EOPNOTSUPP;
++}
++
++const struct amdxdna_dev_ops ve2_ops = {
++	.init			= ve2_init,
++	.fini			= ve2_fini,
++	.get_aie_info		= ve2_get_aie_info,
++	.set_aie_state		= ve2_set_aie_state,
++	.hwctx_init		= ve2_hwctx_init,
++	.hwctx_fini		= ve2_hwctx_fini,
++	.hwctx_config		= ve2_hwctx_config,
++	.hwctx_sync_debug_bo	= ve2_hwctx_sync_debug_bo,
++	.hmm_invalidate		= ve2_hmm_invalidate,
++	.cmd_submit		= ve2_cmd_submit,
++	.get_array		= ve2_get_array,
++};
+diff --git a/drivers/accel/amdxdna/ve2_aux.h b/drivers/accel/amdxdna/ve2_aux.h
+new file mode 100644
+index 0000000..26e996d
+--- /dev/null
++++ b/drivers/accel/amdxdna/ve2_aux.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2025-2026, Advanced Micro Devices, Inc.
++ */
++
++#ifndef _VE2_AUX_H_
++#define _VE2_AUX_H_
++
++#include "amdxdna_drv.h"
++
++extern const struct amdxdna_dev_ops ve2_ops;
++
++#endif /* _VE2_AUX_H_ */
+-- 
+2.43.0
+
