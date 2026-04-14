@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
+ *
+ * PCI attachment for AMD XDNA devices. Board identity comes from the PCI id
+ * table: each entry's .driver_data points at a null-terminated table of
+ * (revision, dev_info) rows so one PCI device ID can map to several NPU
+ * profiles (e.g. 0x17f0 revisions -> NPU4/5/6). Add a new pci_device_id row
+ * and revision map when a new PCI device is supported; keep AIE2/AIE4
+ * implementation in aie2_pci.c / aie4_pci.c and npu*_regs.c.
  */
 
 #include "drm/amdxdna_accel.h"
@@ -32,41 +39,61 @@ MODULE_FIRMWARE("amdnpu/1502_00/npu_7.sbin");
 MODULE_FIRMWARE("amdnpu/17f0_10/npu_7.sbin");
 MODULE_FIRMWARE("amdnpu/17f0_11/npu_7.sbin");
 
-/*
- * Bind the driver base on (vendor_id, device_id) pair and later use the
- * (device_id, rev_id) pair as a key to select the devices. The devices with
- * same device_id have very similar interface to host driver.
+/**
+ * struct amdxdna_pci_rev_map - Map PCI revision to &struct amdxdna_dev_info.
+ * Tables are null-terminated with an entry where %dev_info is NULL.
  */
+struct amdxdna_pci_rev_map {
+	u8 revision;
+	const struct amdxdna_dev_info *dev_info;
+};
+
+static const struct amdxdna_pci_rev_map amdxdna_pci_1502[] = {
+	{ 0x00, &dev_npu1_info },
+	{ }
+};
+
+static const struct amdxdna_pci_rev_map amdxdna_pci_17f0[] = {
+	{ 0x10, &dev_npu4_info },
+	{ 0x11, &dev_npu5_info },
+	{ 0x20, &dev_npu6_info },
+	{ }
+};
+
+static const struct amdxdna_pci_rev_map amdxdna_pci_17f2[] = {
+	{ 0x10, &dev_npu3_pf_info },
+	{ }
+};
+
+static const struct amdxdna_pci_rev_map amdxdna_pci_1b0b[] = {
+	{ 0x10, &dev_npu3_pf_info },
+	{ }
+};
+
 static const struct pci_device_id pci_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x1502) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x17f0) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x17f2) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, 0x1B0B) },
-	{0}
+	{ PCI_VDEVICE(AMD, 0x1502), .driver_data = (kernel_ulong_t)amdxdna_pci_1502 },
+	{ PCI_VDEVICE(AMD, 0x17f0), .driver_data = (kernel_ulong_t)amdxdna_pci_17f0 },
+	{ PCI_VDEVICE(AMD, 0x17f2), .driver_data = (kernel_ulong_t)amdxdna_pci_17f2 },
+	{ PCI_VDEVICE(AMD, 0x1b0b), .driver_data = (kernel_ulong_t)amdxdna_pci_1b0b },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(pci, pci_ids);
 
-static const struct amdxdna_device_id amdxdna_ids[] = {
-	{ 0x1502, 0x0,  &dev_npu1_info },
-	{ 0x17f0, 0x10, &dev_npu4_info },
-	{ 0x17f0, 0x11, &dev_npu5_info },
-	{ 0x17f0, 0x20, &dev_npu6_info },
-	{ 0x17f2, 0x10, &dev_npu3_pf_info },
-	{ 0x1B0B, 0x10, &dev_npu3_pf_info },
-	{0}
-};
-
 static const struct amdxdna_dev_info *
-amdxdna_get_dev_info(struct pci_dev *pdev)
+amdxdna_pci_match_dev_info(struct pci_dev *pdev, const struct pci_device_id *id)
 {
-	int i;
+	const struct amdxdna_pci_rev_map *row =
+		(const struct amdxdna_pci_rev_map *)id->driver_data;
 
-	for (i = 0; i < ARRAY_SIZE(amdxdna_ids); i++) {
-		if (pdev->device == amdxdna_ids[i].device &&
-		    pdev->revision == amdxdna_ids[i].revision)
-			return amdxdna_ids[i].dev_info;
+	if (!row)
+		return NULL;
+
+	for (; row->dev_info; row++) {
+		if (pdev->revision == row->revision)
+			return row->dev_info;
 	}
+
 	return NULL;
 }
 
@@ -80,8 +107,8 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (IS_ERR(xdna))
 		return PTR_ERR(xdna);
 
-	xdna->dev_info = amdxdna_get_dev_info(pdev);
-	if (!xdna->dev_info)
+	xdna->dev_info = amdxdna_pci_match_dev_info(pdev, id);
+	if (!xdna->dev_info || !xdna->dev_info->ops)
 		return -ENODEV;
 
 	pci_set_drvdata(pdev, xdna);
@@ -98,7 +125,7 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		fs_reclaim_release(GFP_KERNEL);
 	}
 
-	xdna->notifier_wq = alloc_ordered_workqueue("notifier_wq", WQ_MEM_RECLAIM);
+	xdna->notifier_wq = alloc_ordered_workqueue("amdxdna_pci_notifier", WQ_MEM_RECLAIM);
 	if (!xdna->notifier_wq) {
 		ret = -ENOMEM;
 		goto failed_iommu_fini;
