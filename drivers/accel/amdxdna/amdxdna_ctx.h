@@ -152,6 +152,12 @@ struct amdxdna_hwctx {
 
 	atomic64_t			job_submit_cnt;
 	atomic64_t			job_free_cnt ____cacheline_aligned_in_smp;
+
+	/*
+	 * Opaque per-hwctx state for auxiliary/backend paths (non-mailbox).
+	 * e.g. VE2 HAL; see ve2_aie.c.
+	 */
+	void				*aux_ctx_priv;
 };
 
 #define drm_job_to_xdna_job(j) \

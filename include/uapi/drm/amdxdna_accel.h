@@ -134,10 +134,43 @@ struct amdxdna_hwctx_param_config_cu {
 	struct amdxdna_cu_config cu_configs[] __counted_by(num_cus);
 };
 
+/**
+ * struct uc_info_entry - uC index and size mapping
+ * @index: uC index
+ * @size: buffer size in bytes for this uC
+ */
+struct uc_info_entry {
+	__u32 index;
+	__u32 size;
+};
+
+/**
+ * struct fw_buffer_metadata - Metadata for debug/trace/log buffer assignment.
+ * @buf_type: One of AMDXDNA_FW_BUF_*.
+ * @num_ucs: Number of uC entries in @uc_info.
+ * @pad: MBZ.
+ * @command_id: Optional command identifier for trace correlation.
+ * @bo_handle: BO handle carrying the actual buffer payload.
+ * @uc_info: Per-uC metadata entries.
+ */
+struct fw_buffer_metadata {
+#define AMDXDNA_FW_BUF_DEBUG	0
+#define AMDXDNA_FW_BUF_TRACE	1
+#define AMDXDNA_FW_BUF_DBG_Q	2
+#define AMDXDNA_FW_BUF_LOG	3
+	__u8 buf_type;
+	__u8 num_ucs;
+	__u8 pad[48];
+	__u64 command_id;
+	__u64 bo_handle;
+	struct uc_info_entry uc_info[] __counted_by(num_ucs);
+};
+
 enum amdxdna_drm_config_hwctx_param {
 	DRM_AMDXDNA_HWCTX_CONFIG_CU,
 	DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
 	DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
+	DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT,
 };
 
 /**
