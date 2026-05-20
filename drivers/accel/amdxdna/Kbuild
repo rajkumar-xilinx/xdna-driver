@@ -24,6 +24,7 @@ obj-m	+= amdxdna.o
 # Only objects that have corresponding .c sources in this directory
 amdxdna-y := \
 	amdxdna_drv.o \
+	amdxdna_hal.o \
 	amdxdna_solver.o \
 	amdxdna_ctx.o \
 	amdxdna_gem.o \
