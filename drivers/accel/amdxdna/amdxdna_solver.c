@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2022-2024, Advanced Micro Devices, Inc.
+ * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  */
 
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
-#include <drm/gpu_scheduler.h>
-#include <linux/bitops.h>
 #include <linux/bitmap.h>
 #include <linux/slab.h>
 
@@ -90,6 +88,13 @@ static int sanity_check(struct solver_state *xrs, struct alloc_requests *req)
 		return -EINVAL;
 
 	/*
+	 * VE2 (AUX) configures no clock/QoS model (num_levels == 0); the
+	 * column-count check above is the only constraint that applies.
+	 */
+	if (!xrs->cfg.clk_list.num_levels)
+		return 0;
+
+	/*
 	 * We can find at least one CDOs groups that meet the
 	 * GOPs requirement.
 	 */
@@ -107,7 +112,7 @@ static bool is_valid_qos_dpm_params(struct aie_qos *rqos)
 	 * gops is retrieved from the xmodel, so it's always set
 	 * fps and latency are the configurable params from the application
 	 */
-	if (rqos->gops > 0 && (rqos->fps > 0 ||  rqos->latency > 0))
+	if (rqos->gops > 0 && (rqos->fps > 0 || rqos->latency > 0))
 		return true;
 
 	return false;
@@ -299,24 +304,27 @@ free_node:
 	return ERR_PTR(ret);
 }
 
-static void fill_load_action(struct solver_state *xrs,
-			     struct solver_node *snode,
+static void fill_load_action(struct solver_node *snode,
 			     struct xrs_action_load *action)
 {
+	if (!action)
+		return;
+
 	action->rid = snode->rid;
 	action->part.start_col = snode->pt_node->start_col;
 	action->part.ncols = snode->pt_node->ncols;
 }
 
-int xrs_allocate_resource(void *hdl, struct alloc_requests *req, void *cb_arg)
+int xrs_allocate_resource(void *hdl, struct alloc_requests *req, void *cb_arg,
+			  struct xrs_action_load *action)
 {
-	struct xrs_action_load load_act;
+	struct solver_state *xrs = hdl;
 	struct solver_node *snode;
-	struct solver_state *xrs;
 	u32 dpm_level;
 	int ret;
 
-	xrs = (struct solver_state *)hdl;
+	if (!xrs || !req)
+		return -EINVAL;
 
 	ret = sanity_check(xrs, req);
 	if (ret) {
@@ -333,17 +341,22 @@ int xrs_allocate_resource(void *hdl, struct alloc_requests *req, void *cb_arg)
 	if (IS_ERR(snode))
 		return PTR_ERR(snode);
 
-	fill_load_action(xrs, snode, &load_act);
-	ret = xrs->cfg.actions->load(cb_arg, &load_act);
-	if (ret)
-		goto free_node;
+	/* Both paths report the chosen columns through @action. */
+	fill_load_action(snode, action);
 
-	ret = set_dpm_level(xrs, req, &dpm_level);
-	if (ret)
-		goto free_node;
+	/* PCI (NPU) only: run the backend load callback and pick a DPM level. */
+	if (xrs->cfg.actions) {
+		ret = xrs->cfg.actions->load(cb_arg, action);
+		if (ret)
+			goto free_node;
 
-	snode->dpm_level = dpm_level;
-	snode->cb_arg = cb_arg;
+		ret = set_dpm_level(xrs, req, &dpm_level);
+		if (ret)
+			goto free_node;
+
+		snode->dpm_level = dpm_level;
+		snode->cb_arg = cb_arg;
+	}
 
 	drm_dbg(xrs->cfg.ddev, "start col %d ncols %d\n",
 		snode->pt_node->start_col, snode->pt_node->ncols);
@@ -356,20 +369,25 @@ free_node:
 	return ret;
 }
 
-int xrs_release_resource(void *hdl, u64 rid)
+int xrs_release_resource(void *hdl, u64 rid, struct xrs_action_load *action)
 {
 	struct solver_state *xrs = hdl;
 	struct solver_node *node;
 
+	if (!xrs || action)
+		return -EINVAL;
+
 	node = rg_search_node(&xrs->rgp, rid);
 	if (!node) {
-		drm_err(xrs->cfg.ddev, "node not exist");
+		drm_err(xrs->cfg.ddev, "rid %lld not found", rid);
 		return -ENODEV;
 	}
 
-	xrs->cfg.actions->unload(node->cb_arg);
-	remove_solver_node(&xrs->rgp, node);
+	/* PCI: invoke backend unload (mailbox destroy_context, DPM, etc.). */
+	if (xrs->cfg.actions)
+		xrs->cfg.actions->unload(node->cb_arg);
 
+	remove_solver_node(&xrs->rgp, node);
 	return 0;
 }
 
@@ -394,33 +412,38 @@ void *xrsm_init(struct init_config *cfg)
 int amdxdna_alloc_resource(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct alloc_requests *xrs_req;
+	struct xrs_action_load load_act = { };
+	struct alloc_requests req = { };
 	int ret;
 
-	xrs_req = kzalloc(sizeof(*xrs_req), GFP_KERNEL);
-	if (!xrs_req)
-		return -ENOMEM;
+	req.rid = (uintptr_t)hwctx;
+	req.cdo.start_cols = hwctx->col_list;
+	req.cdo.cols_len = hwctx->col_list_len;
+#ifdef AMDXDNA_AUX
+	req.cdo.ncols = hwctx->num_tiles;
 
-	xrs_req->cdo.start_cols = hwctx->col_list;
-	xrs_req->cdo.cols_len = hwctx->col_list_len;
-	xrs_req->cdo.ncols = hwctx->num_col;
-	xrs_req->cdo.qos_cap.opc = hwctx->max_opc;
+	ret = xrs_allocate_resource(xdna->xrs_hdl, &req, NULL, &load_act);
+	if (ret)
+		return ret;
 
-	xrs_req->rqos.gops = hwctx->qos.gops;
-	xrs_req->rqos.fps = hwctx->qos.fps;
-	xrs_req->rqos.dma_bw = hwctx->qos.dma_bandwidth;
-	xrs_req->rqos.latency = hwctx->qos.latency;
-	xrs_req->rqos.exec_time = hwctx->qos.frame_exec_time;
-	xrs_req->rqos.priority = hwctx->qos.priority;
+	hwctx->start_col = load_act.part.start_col;
+	hwctx->num_col = load_act.part.ncols;
+#else
+	req.cdo.ncols = hwctx->num_col;
+	req.cdo.qos_cap.opc = hwctx->max_opc;
 
-	xrs_req->rid = (uintptr_t)hwctx;
+	req.rqos.gops = hwctx->qos.gops;
+	req.rqos.fps = hwctx->qos.fps;
+	req.rqos.dma_bw = hwctx->qos.dma_bandwidth;
+	req.rqos.latency = hwctx->qos.latency;
+	req.rqos.exec_time = hwctx->qos.frame_exec_time;
+	req.rqos.priority = hwctx->qos.priority;
 
-	ret = xrs_allocate_resource(xdna->xrs_hdl, xrs_req, hwctx);
+	ret = xrs_allocate_resource(xdna->xrs_hdl, &req, hwctx, &load_act);
 	if (ret)
 		drm_err(&xdna->ddev, "Allocate AIE resource failed, ret %d", ret);
-
-	kfree(xrs_req);
-	return ret;
+#endif
+	return 0;
 }
 
 void amdxdna_release_resource(struct amdxdna_hwctx *hwctx)
@@ -428,7 +451,7 @@ void amdxdna_release_resource(struct amdxdna_hwctx *hwctx)
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int ret;
 
-	ret = xrs_release_resource(xdna->xrs_hdl, (uintptr_t)hwctx);
+	ret = xrs_release_resource(xdna->xrs_hdl, (uintptr_t)hwctx, NULL);
 	if (ret)
 		drm_err(&xdna->ddev, "Release AIE resource failed, ret %d", ret);
 }
