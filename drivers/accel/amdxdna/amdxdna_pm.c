@@ -78,12 +78,14 @@ int amdxdna_pm_runtime_suspend(struct device *dev)
 	if (xdna->dev_info->ops->runtime_suspend)
 		ret = xdna->dev_info->ops->runtime_suspend(xdna);
 
+#ifndef AMDXDNA_AUX
 	if (!ret) {
 		int dpt_ret = amdxdna_dpt_suspend(xdna);
 
 		if (dpt_ret)
 			XDNA_WARN(xdna, "DPT drain/pause on suspend failed: %d", dpt_ret);
 	}
+#endif
 
 	XDNA_DBG(xdna, "Runtime suspend done ret %d", ret);
 	return ret;
@@ -98,12 +100,14 @@ int amdxdna_pm_runtime_resume(struct device *dev)
 	if (xdna->dev_info->ops->runtime_resume)
 		ret = xdna->dev_info->ops->runtime_resume(xdna);
 
+#ifndef AMDXDNA_AUX
 	if (!ret) {
 		int dpt_ret = amdxdna_dpt_resume(xdna);
 
 		if (dpt_ret)
 			XDNA_WARN(xdna, "DPT re-arm on resume failed: %d", dpt_ret);
 	}
+#endif
 
 	XDNA_DBG(xdna, "Runtime resume done ret %d", ret);
 	return ret;
